@@ -16,6 +16,12 @@ type Context interface {
 	// Bot returns the bot instance.
 	Bot() *Bot
 
+	// Boost returns the boost instance.
+	Boost() *BoostUpdated
+
+	// BoostRemoved returns the boost removed from a chat instance.
+	BoostRemoved() *BoostRemoved
+
 	// Update returns the original update.
 	Update() Update
 
@@ -46,11 +52,14 @@ type Context interface {
 	// ChatMember returns chat member changes.
 	ChatMember() *ChatMemberUpdate
 
-	// ChatJoinRequest returns cha
+	// ChatJoinRequest returns the chat join request.
 	ChatJoinRequest() *ChatJoinRequest
 
 	// Migration returns both migration from and to chat IDs.
 	Migration() (int64, int64)
+
+	// Topic returns the topic changes.
+	Topic() *Topic
 
 	// Sender returns the current recipient, depending on the context type.
 	// Returns nil if user is not presented.
@@ -149,6 +158,12 @@ type Context interface {
 	// See Respond from bot.go.
 	Respond(resp ...*CallbackResponse) error
 
+	// RespondText sends a popup response for the current callback query.
+	RespondText(text string) error
+
+	// RespondAlert sends an alert response for the current callback query.
+	RespondAlert(text string) error
+
 	// Get retrieves data from the context.
 	Get(key string) interface{}
 
@@ -169,6 +184,14 @@ func (c *nativeContext) Bot() *Bot {
 	return c.b
 }
 
+func (c *nativeContext) Boost() *BoostUpdated {
+	return c.u.Boost
+}
+
+func (c *nativeContext) BoostRemoved() *BoostRemoved {
+	return c.u.BoostRemoved
+}
+
 func (c *nativeContext) Update() Update {
 	return c.u
 }
@@ -178,12 +201,12 @@ func (c *nativeContext) Message() *Message {
 	case c.u.Message != nil:
 		return c.u.Message
 	case c.u.Callback != nil:
-		return c.u.Callback.Message
+		return c.u.Callback.Message.Message
 	case c.u.EditedMessage != nil:
 		return c.u.EditedMessage
 	case c.u.ChannelPost != nil:
 		if c.u.ChannelPost.PinnedMessage != nil {
-			return c.u.ChannelPost.PinnedMessage
+			return c.u.ChannelPost.PinnedMessage.Message
 		}
 		return c.u.ChannelPost
 	case c.u.EditedChannelPost != nil:
@@ -238,6 +261,22 @@ func (c *nativeContext) PollAnswer() *PollAnswer {
 
 func (c *nativeContext) Migration() (int64, int64) {
 	return c.u.Message.MigrateFrom, c.u.Message.MigrateTo
+}
+
+func (c *nativeContext) Topic() *Topic {
+	m := c.u.Message
+	if m == nil {
+		return nil
+	}
+	switch {
+	case m.TopicCreated != nil:
+		return m.TopicCreated
+	case m.TopicReopened != nil:
+		return m.TopicReopened
+	case m.TopicEdited != nil:
+		return m.TopicEdited
+	}
+	return nil
 }
 
 func (c *nativeContext) Sender() *User {
@@ -336,7 +375,7 @@ func (c *nativeContext) Args() []string {
 	case c.u.Message != nil:
 		payload := strings.Trim(c.u.Message.Payload, " ")
 		if payload != "" {
-			return strings.Split(payload, " ")
+			return strings.Fields(payload)
 		}
 	case c.u.Callback != nil:
 		return strings.Split(c.u.Callback.Data, "|")
@@ -460,6 +499,14 @@ func (c *nativeContext) Respond(resp ...*CallbackResponse) error {
 		return errors.New("telebot: context callback is nil")
 	}
 	return c.b.Respond(c.u.Callback, resp...)
+}
+
+func (c *nativeContext) RespondText(text string) error {
+	return c.Respond(&CallbackResponse{Text: text})
+}
+
+func (c *nativeContext) RespondAlert(text string) error {
+	return c.Respond(&CallbackResponse{Text: text, ShowAlert: true})
 }
 
 func (c *nativeContext) Answer(resp *QueryResponse) error {

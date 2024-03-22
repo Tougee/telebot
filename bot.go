@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cornelk/hashmap"
@@ -83,7 +84,9 @@ type Bot struct {
 	parseMode   ParseMode
 	stop        chan chan struct{}
 	client      *http.Client
-	stopClient  chan struct{}
+
+	stopMu     sync.RWMutex
+	stopClient chan struct{}
 }
 
 // Settings represents a utility struct for passing certain
@@ -175,7 +178,7 @@ var (
 //	b.Handle("/ban", onBan, middleware.Whitelist(ids...))
 func (b *Bot) Handle(endpoint interface{}, h HandlerFunc, m ...MiddlewareFunc) {
 	if len(b.group.middleware) > 0 {
-		m = append(b.group.middleware, m...)
+		m = appendMiddleware(b.group.middleware, m)
 	}
 
 	handler := func(c Context) error {
@@ -200,10 +203,14 @@ func (b *Bot) Start() {
 	}
 
 	// do nothing if called twice
+	b.stopMu.Lock()
 	if b.stopClient != nil {
+		b.stopMu.Unlock()
 		return
 	}
+
 	b.stopClient = make(chan struct{})
+	b.stopMu.Unlock()
 
 	stop := make(chan struct{})
 	stopConfirm := make(chan struct{})
@@ -223,7 +230,6 @@ func (b *Bot) Start() {
 			close(stop)
 			<-stopConfirm
 			close(confirm)
-			b.stopClient = nil
 			return
 		}
 	}
@@ -231,9 +237,13 @@ func (b *Bot) Start() {
 
 // Stop gracefully shuts the poller down.
 func (b *Bot) Stop() {
+	b.stopMu.Lock()
 	if b.stopClient != nil {
 		close(b.stopClient)
+		b.stopClient = nil
 	}
+	b.stopMu.Unlock()
+
 	confirm := make(chan struct{})
 	b.stop <- confirm
 	<-confirm
@@ -285,6 +295,7 @@ func (b *Bot) Send(to Recipient, what interface{}, opts ...interface{}) (*Messag
 }
 
 // SendAlbum sends multiple instances of media as a single message.
+// To include the caption, make sure the first Inputtable of an album has it.
 // From all existing options, it only supports tele.Silent.
 func (b *Bot) SendAlbum(to Recipient, a Album, opts ...interface{}) ([]Message, error) {
 	if to == nil {
@@ -296,21 +307,8 @@ func (b *Bot) SendAlbum(to Recipient, a Album, opts ...interface{}) ([]Message, 
 	files := make(map[string]File)
 
 	for i, x := range a {
-		var (
-			repr string
-			data []byte
-			file = x.MediaFile()
-		)
-
-		switch {
-		case file.InCloud():
-			repr = file.FileID
-		case file.FileURL != "":
-			repr = file.FileURL
-		case file.OnDisk() || file.FileReader != nil:
-			repr = "attach://" + strconv.Itoa(i)
-			files[strconv.Itoa(i)] = *file
-		default:
+		repr := x.MediaFile().process(strconv.Itoa(i), files)
+		if repr == "" {
 			return nil, fmt.Errorf("telebot: album entry #%d does not exist", i)
 		}
 
@@ -323,7 +321,7 @@ func (b *Bot) SendAlbum(to Recipient, a Album, opts ...interface{}) ([]Message, 
 			im.ParseMode = sendOpts.ParseMode
 		}
 
-		data, _ = json.Marshal(im)
+		data, _ := json.Marshal(im)
 		media[i] = string(data)
 	}
 
@@ -404,6 +402,17 @@ func (b *Bot) Forward(to Recipient, msg Editable, opts ...interface{}) (*Message
 	return extractMessage(data)
 }
 
+// ForwardMessages method forwards multiple messages of any kind.
+// If some of the specified messages can't be found or forwarded, they are skipped.
+// Service messages and messages with protected content can't be forwarded.
+// Album grouping is kept for forwarded messages.
+func (b *Bot) ForwardMessages(to Recipient, msgs []Editable, opts ...*SendOptions) ([]Message, error) {
+	if to == nil {
+		return nil, ErrBadRecipient
+	}
+	return b.forwardCopyMessages(to, msgs, "forwardMessages", opts...)
+}
+
 // Copy behaves just like Forward() but the copied message doesn't have a link to the original message (see Bots API).
 //
 // This function will panic upon nil Editable.
@@ -428,6 +437,20 @@ func (b *Bot) Copy(to Recipient, msg Editable, options ...interface{}) (*Message
 	}
 
 	return extractMessage(data)
+}
+
+// CopyMessages this method makes a copy of messages of any kind.
+// If some of the specified messages can't be found or copied, they are skipped.
+// Service messages, giveaway messages, giveaway winners messages, and
+// invoice messages can't be copied. A quiz poll can be copied only if the value of the field
+// correct_option_id is known to the bot. The method is analogous
+// to the method forwardMessages, but the copied messages don't have a link to the original message.
+// Album grouping is kept for copied messages.
+func (b *Bot) CopyMessages(to Recipient, msgs []Editable, opts ...*SendOptions) ([]Message, error) {
+	if to == nil {
+		return nil, ErrBadRecipient
+	}
+	return b.forwardCopyMessages(to, msgs, "copyMessages", opts...)
 }
 
 // Edit is magic, it lets you change already sent message.
@@ -672,6 +695,17 @@ func (b *Bot) Delete(msg Editable) error {
 	return err
 }
 
+// DeleteMessages deletes multiple messages simultaneously.
+// If some of the specified messages can't be found, they are skipped.
+func (b *Bot) DeleteMessages(msgs []Editable) error {
+	params := make(map[string]string)
+
+	embedMessages(params, msgs)
+
+	_, err := b.Raw("deleteMessages", params)
+	return err
+}
+
 // Notify updates the chat action for recipient.
 //
 // Chat action is a status message that recipient would see where
@@ -681,7 +715,7 @@ func (b *Bot) Delete(msg Editable) error {
 //
 // Currently, Telegram supports only a narrow range of possible
 // actions, these are aligned as constants of this package.
-func (b *Bot) Notify(to Recipient, action ChatAction) error {
+func (b *Bot) Notify(to Recipient, action ChatAction, threadID ...int) error {
 	if to == nil {
 		return ErrBadRecipient
 	}
@@ -689,6 +723,10 @@ func (b *Bot) Notify(to Recipient, action ChatAction) error {
 	params := map[string]string{
 		"chat_id": to.Recipient(),
 		"action":  string(action),
+	}
+
+	if len(threadID) > 0 {
+		params["message_thread_id"] = strconv.Itoa(threadID[0])
 	}
 
 	_, err := b.Raw("sendChatAction", params)
@@ -943,7 +981,7 @@ func (b *Bot) StopPoll(msg Editable, opts ...interface{}) (*Poll, error) {
 }
 
 // Leave makes bot leave a group, supergroup or channel.
-func (b *Bot) Leave(chat *Chat) error {
+func (b *Bot) Leave(chat Recipient) error {
 	params := map[string]string{
 		"chat_id": chat.Recipient(),
 	}
@@ -973,7 +1011,7 @@ func (b *Bot) Pin(msg Editable, opts ...interface{}) error {
 
 // Unpin unpins a message in a supergroup or a channel.
 // It supports tb.Silent option.
-func (b *Bot) Unpin(chat *Chat, messageID ...int) error {
+func (b *Bot) Unpin(chat Recipient, messageID ...int) error {
 	params := map[string]string{
 		"chat_id": chat.Recipient(),
 	}
@@ -987,7 +1025,7 @@ func (b *Bot) Unpin(chat *Chat, messageID ...int) error {
 
 // UnpinAll unpins all messages in a supergroup or a channel.
 // It supports tb.Silent option.
-func (b *Bot) UnpinAll(chat *Chat) error {
+func (b *Bot) UnpinAll(chat Recipient) error {
 	params := map[string]string{
 		"chat_id": chat.Recipient(),
 	}
@@ -1146,5 +1184,81 @@ func (b *Bot) Close() (bool, error) {
 		return false, wrapError(err)
 	}
 
+	return resp.Result, nil
+}
+
+// BotInfo represents a single object of BotName, BotDescription, BotShortDescription instances.
+type BotInfo struct {
+	Name             string `json:"name,omitempty"`
+	Description      string `json:"description,omitempty"`
+	ShortDescription string `json:"short_description,omitempty"`
+}
+
+// SetMyName change's the bot name.
+func (b *Bot) SetMyName(name, language string) error {
+	params := map[string]string{
+		"name":          name,
+		"language_code": language,
+	}
+
+	_, err := b.Raw("setMyName", params)
+	return err
+}
+
+// MyName returns the current bot name for the given user language.
+func (b *Bot) MyName(language string) (*BotInfo, error) {
+	return b.botInfo(language, "getMyName")
+}
+
+// SetMyDescription change's the bot description, which is shown in the chat
+// with the bot if the chat is empty.
+func (b *Bot) SetMyDescription(desc, language string) error {
+	params := map[string]string{
+		"description":   desc,
+		"language_code": language,
+	}
+
+	_, err := b.Raw("setMyDescription", params)
+	return err
+}
+
+// MyDescription the current bot description for the given user language.
+func (b *Bot) MyDescription(language string) (*BotInfo, error) {
+	return b.botInfo(language, "getMyDescription")
+}
+
+// SetMyShortDescription change's the bot short description, which is shown on
+// the bot's profile page and is sent together with the link when users share the bot.
+func (b *Bot) SetMyShortDescription(desc, language string) error {
+	params := map[string]string{
+		"short_description": desc,
+		"language_code":     language,
+	}
+
+	_, err := b.Raw("setMyShortDescription", params)
+	return err
+}
+
+// MyShortDescription the current bot short description for the given user language.
+func (b *Bot) MyShortDescription(language string) (*BotInfo, error) {
+	return b.botInfo(language, "getMyShortDescription")
+}
+
+func (b *Bot) botInfo(language, key string) (*BotInfo, error) {
+	params := map[string]string{
+		"language_code": language,
+	}
+
+	data, err := b.Raw(key, params)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		Result *BotInfo
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, wrapError(err)
+	}
 	return resp.Result, nil
 }

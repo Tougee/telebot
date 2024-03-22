@@ -16,7 +16,7 @@ type Callback struct {
 
 	// Message will be set if the button that originated the query
 	// was attached to a message sent by a bot.
-	Message *Message `json:"message"`
+	Message *InaccessibleMessage `json:"message"`
 
 	// MessageID will be set if the button was attached to a message
 	// sent via the bot in inline mode.
@@ -25,6 +25,15 @@ type Callback struct {
 	// Data associated with the callback button. Be aware that
 	// a bad client can send arbitrary data in this field.
 	Data string `json:"data"`
+
+	// ChatInstance is a global identifier, uniquely corresponding to
+	// the chat to which the message with the callback button was sent.
+	ChatInstance string `json:"chat_instance"`
+
+	// GameShortName is a unique identifier of the game for which a URL
+	// is requested from the bot when a user presses the Play button of
+	// that game. GameShortName may be empty
+	GameShortName string `json:"game_short_name"`
 
 	// Unique displays an unique of the button from which the
 	// callback was fired. Sets immediately before the handling,
